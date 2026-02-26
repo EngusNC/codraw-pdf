@@ -11,7 +11,7 @@ const io = new Server(server, {
   maxHttpBufferSize: 50e6 // 50MB for PDF sharing
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
 
 // ── Room state ──
 const rooms = new Map();
