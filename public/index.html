@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>CoDraw PDF — Dessin collaboratif en temps réel</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="/socket.io/socket.io.js"></script>
@@ -495,6 +495,19 @@
       radial-gradient(ellipse at 80% 30%, rgba(58,219,198,0.02) 0%, transparent 50%),
       var(--bg);
     position: relative;
+    overscroll-behavior: none;
+  }
+
+  /* Eraser cursor */
+  .eraser-cursor {
+    position: absolute;
+    pointer-events: none;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.6);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
+    z-index: 55;
+    display: none;
+    transform: translate(-50%, -50%);
   }
 
   .canvas-wrapper {
@@ -511,6 +524,10 @@
     position: absolute;
     top: 0; left: 0;
     cursor: crosshair;
+    touch-action: none;
+    -ms-touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
   }
 
   /* Upload overlay */
@@ -949,6 +966,7 @@
     <div class="canvas-wrapper" id="canvasWrapper">
       <canvas id="pdfCanvas"></canvas>
       <canvas id="drawCanvas"></canvas>
+      <div class="eraser-cursor" id="eraserCursor"></div>
     </div>
   </div>
 </div>
@@ -1070,25 +1088,25 @@ function connectSocket() {
   socket.on('stroke-move', ({ userId, x, y }) => {
     if (!remoteDrawing[userId]) return;
     remoteDrawing[userId].points.push({ x, y });
-    redrawAll();
+    requestRedraw();
   });
 
   socket.on('stroke-end', ({ page, stroke }) => {
     delete remoteDrawing[stroke.userId];
     if (!strokes[page]) strokes[page] = [];
     strokes[page].push(stroke);
-    if (page === currentPage) redrawAll();
+    if (page === currentPage) { invalidateCommitted(); requestRedraw(); }
   });
 
   socket.on('add-shape', ({ page, shape }) => {
     if (!strokes[page]) strokes[page] = [];
     strokes[page].push(shape);
-    if (page === currentPage) redrawAll();
+    if (page === currentPage) { invalidateCommitted(); requestRedraw(); }
   });
 
   socket.on('page-strokes', ({ page, strokes: newStrokes }) => {
     strokes[page] = newStrokes;
-    if (page === currentPage) redrawAll();
+    if (page === currentPage) { invalidateCommitted(); requestRedraw(); }
   });
 
   // ── Cursor ──
@@ -1332,6 +1350,7 @@ async function renderPage() {
   document.getElementById('nextPage').disabled = currentPage >= totalPages;
   document.getElementById('zoomLevel').textContent = Math.round(zoom * 100) + '%';
 
+  invalidateCommitted();
   redrawAll();
 }
 
@@ -1350,40 +1369,116 @@ function changeZoom(delta, reset) {
 }
 
 // ═══════════════════════════════════════
-//  DRAWING
+//  DRAWING (optimized for stylus/tablet)
 // ═══════════════════════════════════════
+let rafPending = false;
+let needsRedraw = false;
+let committedCanvas = null; // offscreen canvas for committed strokes
+let committedDirty = true;  // whether offscreen needs rebuild
+let activePointerId = null; // track the active pointer to reject palm
+
+function invalidateCommitted() {
+  committedDirty = true;
+}
+
+function getCanvasPos(e, dc) {
+  const rect = dc.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+// Extract coalesced points from a pointer event for smooth stylus input
+function getCoalescedPoints(e, dc) {
+  const points = [];
+  const rect = dc.getBoundingClientRect();
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ce of events) {
+    points.push({
+      x: ce.clientX - rect.left,
+      y: ce.clientY - rect.top,
+      pressure: ce.pressure || 0.5
+    });
+  }
+  return points;
+}
+
+function requestRedraw() {
+  if (!rafPending) {
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      redrawAll();
+    });
+  }
+}
+
+// Eraser cursor tracking
+function updateEraserCursor(x, y, show) {
+  const ec = document.getElementById('eraserCursor');
+  if (!show) { ec.style.display = 'none'; return; }
+  const eraserSize = currentSize * 4;
+  ec.style.display = 'block';
+  ec.style.width = eraserSize + 'px';
+  ec.style.height = eraserSize + 'px';
+  ec.style.left = x + 'px';
+  ec.style.top = y + 'px';
+}
+
 function setupDrawing() {
   const dc = document.getElementById('drawCanvas');
 
+  // Prevent all touch default behaviors on canvas (scroll, zoom, long-press)
+  dc.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+  dc.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  dc.addEventListener('touchend', (e) => e.preventDefault(), { passive: false });
+
+  // Prevent context menu on long-press
+  dc.addEventListener('contextmenu', (e) => e.preventDefault());
+
   dc.addEventListener('pointerdown', (e) => {
+    // Palm rejection: ignore touch if a pen is already active, or if this is a
+    // touch and a pointer is already drawing. Accept pen input always (it takes priority).
+    if (isDrawing && activePointerId !== null && e.pointerId !== activePointerId) {
+      // Another pointer while we're already drawing — ignore it
+      return;
+    }
+    // If a touch event arrives while we want pen-only, prefer pen. But if user
+    // is using finger (no pen), allow touch. We reject only multi-touch.
+    if (e.pointerType === 'touch' && isDrawing) return;
+
     if (currentTool === 'select') return;
 
     if (currentTool === 'text') {
       const text = prompt('Texte à ajouter :');
       if (!text) return;
-      const rect = dc.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      const shape = { tool: 'text', color: currentColor, size: currentSize * 5, text, x, y };
+      const pos = getCanvasPos(e, dc);
+      const shape = { tool: 'text', color: currentColor, size: currentSize * 5, text, x: pos.x, y: pos.y };
       pushStroke(shape);
+      invalidateCommitted();
       if (socket) socket.emit('add-shape', { page: currentPage, shape });
-      redrawAll();
+      requestRedraw();
       return;
     }
 
+    e.preventDefault();
     isDrawing = true;
-    const rect = dc.getBoundingClientRect();
-    startX = e.clientX - rect.left;
-    startY = e.clientY - rect.top;
+    activePointerId = e.pointerId;
+    const pos = getCanvasPos(e, dc);
+    startX = pos.x;
+    startY = pos.y;
 
     if (currentTool === 'pen' || currentTool === 'highlight' || currentTool === 'eraser') {
+      const pressure = e.pressure || 0.5;
       currentStroke = {
         tool: currentTool,
         color: currentTool === 'eraser' ? '#000' : currentColor,
         size: currentTool === 'eraser' ? currentSize * 4 : currentSize,
         opacity: currentTool === 'highlight' ? 0.35 : 1,
-        points: [{ x: startX, y: startY }]
+        points: [{ x: startX, y: startY, pressure }]
       };
+
+      if (currentTool === 'eraser') {
+        updateEraserCursor(startX, startY, true);
+      }
 
       if (socket && currentTool !== 'eraser') {
         socket.emit('stroke-start', {
@@ -1399,71 +1494,112 @@ function setupDrawing() {
     dc.setPointerCapture(e.pointerId);
   });
 
-  dc.addEventListener('pointermove', (e) => {
-    const rect = dc.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+  // Throttle cursor emissions to ~30fps
+  let lastCursorEmit = 0;
 
-    // Send cursor position
-    if (socket && pdfDoc) {
-      socket.emit('cursor-move', { x, y, page: currentPage });
+  dc.addEventListener('pointermove', (e) => {
+    // Ignore events from other pointers during drawing
+    if (isDrawing && e.pointerId !== activePointerId) return;
+
+    const pos = getCanvasPos(e, dc);
+
+    // Show eraser cursor when eraser tool is active
+    if (currentTool === 'eraser') {
+      updateEraserCursor(pos.x, pos.y, true);
+    }
+
+    // Send cursor position (throttled)
+    const now = performance.now();
+    if (socket && pdfDoc && now - lastCursorEmit > 33) {
+      lastCursorEmit = now;
+      socket.emit('cursor-move', { x: pos.x, y: pos.y, page: currentPage });
     }
 
     if (!isDrawing) return;
+    e.preventDefault();
 
     if (currentStroke && (currentTool === 'pen' || currentTool === 'highlight' || currentTool === 'eraser')) {
-      currentStroke.points.push({ x, y });
-      redrawAll();
-      drawStroke(document.getElementById('drawCanvas').getContext('2d'), currentStroke);
+      // Use coalesced events for smoother stylus input
+      const coalescedPoints = getCoalescedPoints(e, dc);
+      for (const pt of coalescedPoints) {
+        currentStroke.points.push(pt);
+      }
+
+      if (currentTool === 'eraser') {
+        updateEraserCursor(pos.x, pos.y, true);
+      }
+
+      requestRedraw();
 
       if (socket && currentTool !== 'eraser') {
-        socket.emit('stroke-move', { x, y });
+        socket.emit('stroke-move', { x: pos.x, y: pos.y });
       }
     } else if (['line', 'rect', 'circle'].includes(currentTool)) {
-      redrawAll();
-      drawShapePreview(document.getElementById('drawCanvas').getContext('2d'), x, y);
+      requestRedraw();
     }
   });
 
   dc.addEventListener('pointerup', (e) => {
-    if (!isDrawing) return;
-    isDrawing = false;
-    const rect = dc.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    if (!isDrawing || e.pointerId !== activePointerId) return;
+    finishDrawing(e, dc);
+  });
 
-    let finalStroke = null;
+  dc.addEventListener('pointercancel', (e) => {
+    if (!isDrawing || e.pointerId !== activePointerId) return;
+    finishDrawing(e, dc);
+  });
 
-    if (currentTool === 'pen' || currentTool === 'highlight') {
+  // Hide eraser cursor when leaving canvas
+  dc.addEventListener('pointerleave', () => {
+    updateEraserCursor(0, 0, false);
+  });
+}
+
+function finishDrawing(e, dc) {
+  isDrawing = false;
+  activePointerId = null;
+  const pos = getCanvasPos(e, dc);
+  updateEraserCursor(0, 0, false);
+
+  let finalStroke = null;
+
+  if (currentTool === 'pen' || currentTool === 'highlight') {
+    if (currentStroke && currentStroke.points.length >= 2) {
       finalStroke = currentStroke;
-    } else if (currentTool === 'eraser') {
-      eraseAt(currentStroke.points);
-      currentStroke = null;
-      redrawAll();
-      return;
-    } else if (currentTool === 'line') {
-      finalStroke = { tool: 'line', color: currentColor, size: currentSize, opacity: 1, x1: startX, y1: startY, x2: x, y2: y };
-    } else if (currentTool === 'rect') {
-      finalStroke = { tool: 'rect', color: currentColor, size: currentSize, opacity: 1, x1: startX, y1: startY, x2: x, y2: y };
-    } else if (currentTool === 'circle') {
-      finalStroke = { tool: 'circle', color: currentColor, size: currentSize, opacity: 1, cx: (startX+x)/2, cy: (startY+y)/2, rx: Math.abs(x-startX)/2, ry: Math.abs(y-startY)/2 };
+    } else if (currentStroke) {
+      // Single point — make it a dot
+      currentStroke.points.push({ x: currentStroke.points[0].x + 0.1, y: currentStroke.points[0].y + 0.1, pressure: currentStroke.points[0].pressure });
+      finalStroke = currentStroke;
     }
+  } else if (currentTool === 'eraser') {
+    if (currentStroke) eraseAt(currentStroke.points);
+    currentStroke = null;
+    invalidateCommitted();
+    requestRedraw();
+    return;
+  } else if (currentTool === 'line') {
+    finalStroke = { tool: 'line', color: currentColor, size: currentSize, opacity: 1, x1: startX, y1: startY, x2: pos.x, y2: pos.y };
+  } else if (currentTool === 'rect') {
+    finalStroke = { tool: 'rect', color: currentColor, size: currentSize, opacity: 1, x1: startX, y1: startY, x2: pos.x, y2: pos.y };
+  } else if (currentTool === 'circle') {
+    finalStroke = { tool: 'circle', color: currentColor, size: currentSize, opacity: 1, cx: (startX+pos.x)/2, cy: (startY+pos.y)/2, rx: Math.abs(pos.x-startX)/2, ry: Math.abs(pos.y-startY)/2 };
+  }
 
-    if (finalStroke) {
-      pushStroke(finalStroke);
+  if (finalStroke) {
+    pushStroke(finalStroke);
+    invalidateCommitted();
 
-      if (socket) {
-        if (finalStroke.points) {
-          socket.emit('stroke-end', { page: currentPage, stroke: finalStroke });
-        } else {
-          socket.emit('add-shape', { page: currentPage, shape: finalStroke });
-        }
+    if (socket) {
+      if (finalStroke.points) {
+        socket.emit('stroke-end', { page: currentPage, stroke: finalStroke });
+      } else {
+        socket.emit('add-shape', { page: currentPage, shape: finalStroke });
       }
     }
+  }
 
-    currentStroke = null;
-    redrawAll();
-  });
+  currentStroke = null;
+  requestRedraw();
 }
 
 function pushStroke(stroke) {
@@ -1471,22 +1607,73 @@ function pushStroke(stroke) {
   strokes[currentPage].push(stroke);
 }
 
+// Hit-test a single point against a stroke/shape, returns true if within threshold
+function hitTestStroke(stroke, px, py, threshold) {
+  if (stroke.tool === 'pen' || stroke.tool === 'highlight') {
+    if (!stroke.points) return false;
+    return stroke.points.some(sp => Math.hypot(sp.x - px, sp.y - py) < threshold);
+  }
+  if (stroke.tool === 'line') {
+    return distPointToSegment(px, py, stroke.x1, stroke.y1, stroke.x2, stroke.y2) < threshold;
+  }
+  if (stroke.tool === 'rect') {
+    const x1 = Math.min(stroke.x1, stroke.x2), x2 = Math.max(stroke.x1, stroke.x2);
+    const y1 = Math.min(stroke.y1, stroke.y2), y2 = Math.max(stroke.y1, stroke.y2);
+    // Check proximity to any of the 4 edges
+    return (
+      distPointToSegment(px, py, x1, y1, x2, y1) < threshold ||
+      distPointToSegment(px, py, x2, y1, x2, y2) < threshold ||
+      distPointToSegment(px, py, x2, y2, x1, y2) < threshold ||
+      distPointToSegment(px, py, x1, y2, x1, y1) < threshold
+    );
+  }
+  if (stroke.tool === 'circle') {
+    // Check if point is near the ellipse boundary
+    const { cx, cy, rx, ry } = stroke;
+    if (rx < 1 || ry < 1) return false;
+    const nx = (px - cx) / rx, ny = (py - cy) / ry;
+    const dist = Math.abs(Math.sqrt(nx*nx + ny*ny) - 1) * Math.min(rx, ry);
+    return dist < threshold;
+  }
+  if (stroke.tool === 'text') {
+    // Approximate text bounding box
+    const textWidth = stroke.text.length * stroke.size * 0.6;
+    const textHeight = stroke.size;
+    return px >= stroke.x - 5 && px <= stroke.x + textWidth + 5 &&
+           py >= stroke.y - textHeight - 5 && py <= stroke.y + 5;
+  }
+  return false;
+}
+
+// Distance from point to line segment
+function distPointToSegment(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const lenSq = dx*dx + dy*dy;
+  if (lenSq === 0) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1)*dx + (py - y1)*dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t*dx), py - (y1 + t*dy));
+}
+
 function eraseAt(points) {
-  if (!strokes[currentPage]) return;
+  if (!strokes[currentPage] || strokes[currentPage].length === 0) return;
+  const threshold = (currentSize * 4) / 2 + 5; // based on eraser size
   const before = strokes[currentPage].length;
-  strokes[currentPage] = strokes[currentPage].filter(s => {
-    if (s.points) {
-      return !s.points.some(sp =>
-        points.some(ep => Math.hypot(sp.x - ep.x, sp.y - ep.y) < 20)
-      );
-    }
-    return true;
+
+  strokes[currentPage] = strokes[currentPage].filter(stroke => {
+    // Check if any eraser point hits this stroke
+    return !points.some(ep => hitTestStroke(stroke, ep.x, ep.y, threshold));
   });
+
   if (strokes[currentPage].length !== before && socket) {
-    // Sync full page state after erase
-    socket.emit('clear-page', { page: currentPage }); // simplified
+    // Sync erased state: send the remaining strokes for this page
+    socket.emit('clear-page', { page: currentPage });
     strokes[currentPage].forEach(s => {
-      socket.emit('add-shape', { page: currentPage, shape: s });
+      if (s.points) {
+        socket.emit('stroke-end', { page: currentPage, stroke: s });
+      } else {
+        socket.emit('add-shape', { page: currentPage, shape: s });
+      }
     });
   }
 }
@@ -1501,7 +1688,8 @@ function undo() {
         break;
       }
     }
-    redrawAll();
+    invalidateCommitted();
+    requestRedraw();
     if (socket) socket.emit('undo', { page: currentPage });
   }
 }
@@ -1509,26 +1697,71 @@ function undo() {
 function clearPage() {
   if (!confirm('Effacer tous les dessins de cette page ?')) return;
   strokes[currentPage] = [];
-  redrawAll();
+  invalidateCommitted();
+  requestRedraw();
   if (socket) socket.emit('clear-page', { page: currentPage });
 }
 
 // ═══════════════════════════════════════
-//  RENDERING
+//  RENDERING (optimized with offscreen canvas)
 // ═══════════════════════════════════════
+function rebuildCommittedCanvas(dc) {
+  if (!committedCanvas) {
+    committedCanvas = document.createElement('canvas');
+  }
+  committedCanvas.width = dc.width;
+  committedCanvas.height = dc.height;
+  const ctx = committedCanvas.getContext('2d');
+  ctx.clearRect(0, 0, dc.width, dc.height);
+  (strokes[currentPage] || []).forEach(s => drawStroke(ctx, s));
+  committedDirty = false;
+}
+
 function redrawAll() {
   const dc = document.getElementById('drawCanvas');
   const ctx = dc.getContext('2d');
   ctx.clearRect(0, 0, dc.width, dc.height);
 
-  // Draw committed strokes
-  (strokes[currentPage] || []).forEach(s => drawStroke(ctx, s));
+  // Rebuild offscreen canvas if strokes changed (commit, undo, erase, page change)
+  if (committedDirty || !committedCanvas || committedCanvas.width !== dc.width) {
+    rebuildCommittedCanvas(dc);
+  }
+
+  // Blit committed strokes from offscreen
+  ctx.drawImage(committedCanvas, 0, 0);
 
   // Draw remote in-progress strokes
   Object.values(remoteDrawing).forEach(s => {
     if (s.points?.length > 1) drawStroke(ctx, s);
   });
+
+  // Draw current in-progress stroke (pen/highlight only, not eraser)
+  if (currentStroke && currentTool !== 'eraser') {
+    drawStroke(ctx, currentStroke);
+  }
+
+  // Draw shape preview for line/rect/circle
+  if (isDrawing && ['line', 'rect', 'circle'].includes(currentTool)) {
+    const dc2 = document.getElementById('drawCanvas');
+    const rect = dc2.getBoundingClientRect();
+    // We need current mouse position — stored from pointermove
+    drawShapePreview(ctx, lastMoveX, lastMoveY);
+  }
 }
+
+let lastMoveX = 0, lastMoveY = 0;
+
+// Patch pointermove to track last position for shape preview
+const _origSetupDrawing = setupDrawing;
+setupDrawing = function() {
+  _origSetupDrawing();
+  const dc = document.getElementById('drawCanvas');
+  dc.addEventListener('pointermove', (e) => {
+    const rect = dc.getBoundingClientRect();
+    lastMoveX = e.clientX - rect.left;
+    lastMoveY = e.clientY - rect.top;
+  });
+};
 
 function drawStroke(ctx, s) {
   ctx.save();
@@ -1541,14 +1774,41 @@ function drawStroke(ctx, s) {
 
   if (s.tool === 'pen' || s.tool === 'highlight') {
     if (s.points?.length > 1) {
-      ctx.beginPath();
-      ctx.moveTo(s.points[0].x, s.points[0].y);
-      for (let i = 1; i < s.points.length; i++) {
-        const p0 = s.points[i - 1], p1 = s.points[i];
-        const mx = (p0.x + p1.x) / 2, my = (p0.y + p1.y) / 2;
-        ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+      // Check if points have pressure data for variable-width strokes
+      const hasPressure = s.points.some(p => p.pressure !== undefined && p.pressure !== 0.5);
+
+      if (hasPressure && s.tool === 'pen') {
+        // Pressure-sensitive drawing: draw segments with variable width
+        for (let i = 1; i < s.points.length; i++) {
+          const p0 = s.points[i - 1], p1 = s.points[i];
+          const pressure = (p0.pressure || 0.5) * 0.8 + (p1.pressure || 0.5) * 0.2;
+          const width = s.size * (0.4 + pressure * 1.2);
+          ctx.lineWidth = Math.max(0.5, width);
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          const mx = (p0.x + p1.x) / 2, my = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+          ctx.stroke();
+        }
+      } else {
+        // Standard smooth drawing
+        ctx.beginPath();
+        ctx.moveTo(s.points[0].x, s.points[0].y);
+        for (let i = 1; i < s.points.length; i++) {
+          const p0 = s.points[i - 1], p1 = s.points[i];
+          const mx = (p0.x + p1.x) / 2, my = (p0.y + p1.y) / 2;
+          ctx.quadraticCurveTo(p0.x, p0.y, mx, my);
+        }
+        // Draw to the last point
+        const last = s.points[s.points.length - 1];
+        ctx.lineTo(last.x, last.y);
+        ctx.stroke();
       }
-      ctx.stroke();
+    } else if (s.points?.length === 1) {
+      // Single point — draw a dot
+      ctx.beginPath();
+      ctx.arc(s.points[0].x, s.points[0].y, s.size / 2, 0, Math.PI * 2);
+      ctx.fill();
     }
   } else if (s.tool === 'line') {
     ctx.beginPath();
@@ -1584,7 +1844,7 @@ function drawShapePreview(ctx, x, y) {
     ctx.beginPath(); ctx.rect(startX, startY, x - startX, y - startY); ctx.stroke();
   } else if (currentTool === 'circle') {
     ctx.beginPath();
-    ctx.ellipse((startX+x)/2, (startY+y)/2, Math.abs(x-startX)/2, Math.abs(y-startY)/2, 0, 0, Math.PI*2);
+    ctx.ellipse((startX+x)/2, (startY+y)/2, Math.max(1, Math.abs(x-startX)/2), Math.max(1, Math.abs(y-startY)/2), 0, 0, Math.PI*2);
     ctx.stroke();
   }
 
@@ -1640,8 +1900,12 @@ function setupToolbar() {
 
 function updateCursor() {
   const dc = document.getElementById('drawCanvas');
-  const cursors = { select: 'default', eraser: 'cell', text: 'text' };
+  const cursors = { select: 'default', eraser: 'none', text: 'text' };
   dc.style.cursor = cursors[currentTool] || 'crosshair';
+  // Show/hide eraser cursor
+  if (currentTool !== 'eraser') {
+    updateEraserCursor(0, 0, false);
+  }
 }
 
 function updateSizeDot() {
