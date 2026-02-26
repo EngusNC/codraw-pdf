@@ -1,0 +1,22 @@
+services:
+  codraw:
+    build: .
+    container_name: codraw-pdf
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.codraw.rule=Host(`codraw.ethlab.fr`)"
+      - "traefik.http.routers.codraw.entrypoints=websecure"
+      - "traefik.http.routers.codraw.tls.certresolver=mytlschallenge"
+      - "traefik.http.services.codraw.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true

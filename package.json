@@ -1,0 +1,13 @@
+{
+  "name": "codraw-pdf",
+  "version": "1.0.0",
+  "description": "Collaborative PDF drawing in real-time with Socket.io",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "socket.io": "^4.8.0"
+  }
+}
