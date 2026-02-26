@@ -1391,11 +1391,15 @@ function getCoalescedPoints(e, dc) {
   const points = [];
   const rect = dc.getBoundingClientRect();
   const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  const isPen = e.pointerType === 'pen';
   for (const ce of events) {
+    // For stylus: skip hover points (pressure === 0)
+    if (isPen && ce.pressure === 0) continue;
     points.push({
       x: ce.clientX - rect.left,
       y: ce.clientY - rect.top,
-      pressure: ce.pressure || 0.5
+      // For pen: use actual pressure; for mouse/touch: default to 0.5
+      pressure: isPen ? (ce.pressure > 0 ? ce.pressure : 0.5) : (ce.pressure || 0.5)
     });
   }
   return points;
@@ -1435,6 +1439,9 @@ function setupDrawing() {
   dc.addEventListener('contextmenu', (e) => e.preventDefault());
 
   dc.addEventListener('pointerdown', (e) => {
+    // Stylus hover rejection: ignore pen events with zero pressure (hovering, not touching)
+    if (e.pointerType === 'pen' && e.pressure === 0) return;
+
     // Palm rejection: ignore touch if a pen is already active, or if this is a
     // touch and a pointer is already drawing. Accept pen input always (it takes priority).
     if (isDrawing && activePointerId !== null && e.pointerId !== activePointerId) {
@@ -1467,7 +1474,7 @@ function setupDrawing() {
     startY = pos.y;
 
     if (currentTool === 'pen' || currentTool === 'highlight' || currentTool === 'eraser') {
-      const pressure = e.pressure || 0.5;
+      const pressure = (e.pointerType === 'pen' && e.pressure > 0) ? e.pressure : (e.pressure || 0.5);
       currentStroke = {
         tool: currentTool,
         color: currentTool === 'eraser' ? '#000' : currentColor,
@@ -1501,6 +1508,10 @@ function setupDrawing() {
     // Ignore events from other pointers during drawing
     if (isDrawing && e.pointerId !== activePointerId) return;
 
+    // Stylus hover: ignore zero-pressure pen moves while drawing
+    // (prevents hover-before-contact from disrupting the stroke)
+    if (isDrawing && e.pointerType === 'pen' && e.pressure === 0) return;
+
     const pos = getCanvasPos(e, dc);
 
     // Show eraser cursor when eraser tool is active
@@ -1527,6 +1538,9 @@ function setupDrawing() {
 
       if (currentTool === 'eraser') {
         updateEraserCursor(pos.x, pos.y, true);
+        // Erase in real-time as the eraser moves
+        eraseAt(coalescedPoints);
+        invalidateCommitted();
       }
 
       requestRedraw();
@@ -1572,9 +1586,8 @@ function finishDrawing(e, dc) {
       finalStroke = currentStroke;
     }
   } else if (currentTool === 'eraser') {
-    if (currentStroke) eraseAt(currentStroke.points);
+    // Real-time erasing already handled during pointermove
     currentStroke = null;
-    invalidateCommitted();
     requestRedraw();
     return;
   } else if (currentTool === 'line') {
@@ -1659,13 +1672,54 @@ function eraseAt(points) {
   if (!strokes[currentPage] || strokes[currentPage].length === 0) return;
   const threshold = (currentSize * 4) / 2 + 5; // based on eraser size
   const before = strokes[currentPage].length;
+  const newStrokes = [];
 
-  strokes[currentPage] = strokes[currentPage].filter(stroke => {
-    // Check if any eraser point hits this stroke
-    return !points.some(ep => hitTestStroke(stroke, ep.x, ep.y, threshold));
-  });
+  for (const stroke of strokes[currentPage]) {
+    // For pen/highlight strokes: split locally, keeping segments outside eraser
+    if ((stroke.tool === 'pen' || stroke.tool === 'highlight') && stroke.points) {
+      let hit = false;
+      // Find which points are hit by the eraser
+      const keep = stroke.points.map(sp => {
+        const erased = points.some(ep => Math.hypot(sp.x - ep.x, sp.y - ep.y) < threshold);
+        if (erased) hit = true;
+        return !erased;
+      });
 
-  if (strokes[currentPage].length !== before && socket) {
+      if (!hit) {
+        // No points erased — keep stroke as-is
+        newStrokes.push(stroke);
+        continue;
+      }
+
+      // Split remaining points into contiguous segments
+      let segStart = -1;
+      for (let i = 0; i <= keep.length; i++) {
+        if (i < keep.length && keep[i]) {
+          if (segStart === -1) segStart = i;
+        } else {
+          if (segStart !== -1) {
+            const segPoints = stroke.points.slice(segStart, i);
+            if (segPoints.length >= 2) {
+              newStrokes.push({
+                ...stroke,
+                points: segPoints
+              });
+            }
+            segStart = -1;
+          }
+        }
+      }
+    } else {
+      // For shapes (line, rect, circle, text): remove entire shape if hit
+      const hit = points.some(ep => hitTestStroke(stroke, ep.x, ep.y, threshold));
+      if (!hit) newStrokes.push(stroke);
+    }
+  }
+
+  const changed = newStrokes.length !== before || newStrokes.some((s, i) => s !== strokes[currentPage][i]);
+  strokes[currentPage] = newStrokes;
+
+  if (changed && socket) {
     // Sync erased state: send the remaining strokes for this page
     socket.emit('clear-page', { page: currentPage });
     strokes[currentPage].forEach(s => {
